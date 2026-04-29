@@ -1,0 +1,15 @@
+{
+  "name": "abano-website-export",
+  "version": "1.0.0",
+  "description": "WordPress static export for www.abano.be",
+  "scripts": {
+    "export": "node scripts/export.js",
+    "serve": "npx serve . -p 3000"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "fs-extra": "^11.2.0",
+    "node-fetch": "^2.7.0",
+    "p-limit": "^3.1.0"
+  }
+}
