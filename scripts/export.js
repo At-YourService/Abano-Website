@@ -673,6 +673,12 @@ ${entries.map(({ loc, lastmod, changefreq, priority }) =>
 // ─── Static helper files ──────────────────────────────────────────────────────
 
 async function writeStaticFiles(navItems) {
+  // CNAME — tells GitHub Pages to serve on www.abano.be so root-relative links work
+  await fs.writeFile(path.join(OUTPUT_DIR, "CNAME"), "www.abano.be\n");
+
+  // .nojekyll — disables Jekyll so GitHub Pages serves plain HTML as-is
+  await fs.writeFile(path.join(OUTPUT_DIR, ".nojekyll"), "");
+
   // robots.txt
   await fs.writeFile(path.join(OUTPUT_DIR, "robots.txt"),
     `User-agent: *\nAllow: /\nSitemap: ${BASE_URL}/sitemap.xml\n`);
@@ -748,7 +754,7 @@ async function main() {
   console.log("Abano static export\n");
 
   // Clean generated output, keep project source files
-  const KEEP = new Set(["scripts", "node_modules", "package.json", "package-lock.json", ".git", ".gitignore"]);
+  const KEEP = new Set(["scripts", "node_modules", "package.json", "package-lock.json", ".git", ".gitignore", ".nojekyll", "CNAME"]);
   for (const entry of await fs.readdir(OUTPUT_DIR)) {
     if (!KEEP.has(entry)) await fs.remove(path.join(OUTPUT_DIR, entry));
   }
