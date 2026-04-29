@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 "use strict";
 
-const fetch   = require("node-fetch");
-const fs      = require("fs-extra");
-const path    = require("path");
-const cheerio = require("cheerio");
-const pLimit  = require("p-limit");
-const { URL } = require("url");
+const fetch      = require("node-fetch");
+const fs         = require("fs-extra");
+const path       = require("path");
+const cheerio    = require("cheerio");
+const pLimit     = require("p-limit");
+const puppeteer  = require("puppeteer");
+const { URL }    = require("url");
+
+let browser; // shared Puppeteer instance
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -142,8 +145,15 @@ function stripNoise($) {
     'meta[name="generator"]',
   ];
   $(SELECTORS.join(", ")).remove();
-  // Remove all scripts but keep <noscript> for accessibility
-  $("script").remove();
+
+  // Remove only external tracking/analytics scripts.
+  // Keep inline scripts (Divi page config, icon data) so icon fonts render correctly.
+  $("script[src]").each((_, el) => {
+    const src = $(el).attr("src") || "";
+    const isTracking = /google(tag|analytics|syndication)|facebook|hotjar|gtm\.|clarity|linkedin/i.test(src);
+    const isWPAdmin  = /wp-emoji|wp-embed|admin-bar/i.test(src);
+    if (isTracking || isWPAdmin) $(el).remove();
+  });
 }
 
 // ─── Navigation ───────────────────────────────────────────────────────────────
@@ -243,151 +253,265 @@ ${bodyContent}
 
 // ─── Homepage ─────────────────────────────────────────────────────────────────
 
-async function generateHomepage(navItems) {
-  console.log("  Fetching live homepage...");
-  const res = await fetch(BASE_URL, { timeout: 20000 });
-  if (!res.ok) throw new Error(`Homepage: HTTP ${res.status}`);
+async function generateHomepage() {
+  console.log("  Rendering live homepage with browser...");
+  const page = await browser.newPage();
 
-  const $ = cheerio.load(await res.text());
-  stripNoise($);
-
-  // Collect and remove <style> blocks — we'll re-inline them
-  const styles = [];
-  $("style").each((_, el) => { styles.push($(el).html()); $(el).remove(); });
-  siteStyles = styles.join("\n");
-
-  // Collect and download linked stylesheets, relink to local paths
-  const cssJobs = [];
-  $('link[rel="stylesheet"][href]').each((_, el) => {
-    cssJobs.push(limit(async () => {
-      const href = $(el).attr("href");
-      try {
-        const abs = new URL(href, BASE_URL).href;
-        if (isInternal(abs)) {
-          const local = await downloadAsset(abs);
-          // Also process @import / url() inside downloaded CSS
-          const cssPath = path.join(ASSETS_DIR, new URL(abs).pathname);
-          if (await fs.pathExists(cssPath)) {
-            const raw       = await fs.readFile(cssPath, "utf8");
-            const processed = await processCSSText(raw, abs);
-            if (processed !== raw) await fs.writeFile(cssPath, processed);
-          }
-          $(el).attr("href", local);
-        }
-      } catch {}
-    }));
+  await page.setRequestInterception(true);
+  page.on("request", req => {
+    const url = req.url();
+    if (["image", "stylesheet", "font", "media"].includes(req.resourceType()) && isInternal(url))
+      assetCache.has(url) || assetCache.set(url, null); // mark for download
+    if (/google(tag|analytics)|facebook|hotjar|gtm\.|clarity|linkedin/i.test(url))
+      req.abort();
+    else
+      req.continue();
   });
-  await Promise.all(cssJobs);
 
+  await page.goto(BASE_URL, { waitUntil: "networkidle2", timeout: 30000 });
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  await new Promise(r => setTimeout(r, 800));
+
+  await page.evaluate(() => {
+    ["#wpadminbar", ".cookie-notice", "#cookie-notice", ".cc-window"].forEach(
+      sel => document.querySelectorAll(sel).forEach(el => el.remove())
+    );
+    document.querySelectorAll("script[src]").forEach(s => {
+      if (/google(tag|analytics)|facebook|hotjar|gtm\.|clarity|linkedin/i.test(s.src)) s.remove();
+    });
+  });
+
+  const html = await page.content();
+  await page.close();
+
+  // Download all assets the homepage loaded
+  const $ = cheerio.load(html);
   await localizeAssets($, BASE_URL);
   fixLinks($, BASE_URL);
 
-  const title = $("title").text() || "Abano";
-  $("title").remove(); // avoid duplicate; shell adds its own
+  $("img[src], source[src]").each((_, el) => {
+    const src   = $(el).attr("src");
+    const local = src ? assetCache.get(new URL(src, BASE_URL).href) : null;
+    if (local) $(el).attr("src", local).removeAttr("srcset").removeAttr("sizes");
+  });
+  $('link[rel="stylesheet"][href]').each((_, el) => {
+    const href  = $(el).attr("href");
+    const local = href ? assetCache.get(new URL(href, BASE_URL).href) : null;
+    if (local) $(el).attr("href", local);
+  });
 
-  const out = `<!DOCTYPE html>
-<html lang="nl">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${title}</title>
-  <link rel="canonical" href="${BASE_URL}/">
-  ${$("head").html() || ""}
-  <style>${siteStyles}</style>
-</head>
-<body>
-${$("body").html() || ""}
-</body>
-</html>`;
-
-  await fs.writeFile(path.join(OUTPUT_DIR, "index.html"), out);
+  await fs.writeFile(path.join(OUTPUT_DIR, "index.html"), $.html());
   console.log("  ✓ index.html");
 }
 
-// ─── HTML page crawling ───────────────────────────────────────────────────────
+// ─── HTML page crawling (Puppeteer) ──────────────────────────────────────────
 
-// Fetch one live page, strip noise, localize assets, write index.html
-async function crawlPage(pagePath, navItems) {
+// Use a real browser to render each page so Divi JS runs fully.
+// Intercepts every asset request and saves internal ones to disk.
+// Writes index.html only when shouldWrite=true; always returns discovered links.
+async function crawlPage(pagePath, navItems, shouldWrite = true) {
   const liveURL = `${BASE_URL}${pagePath}`;
-  const res = await fetch(liveURL, { timeout: 20000 });
-  if (!res.ok) {
-    console.warn(`  ⚠ ${liveURL} — HTTP ${res.status}, skipping`);
+  const page    = await browser.newPage();
+
+  // Track assets requested by the page so we can download them
+  const assetRequests = new Set();
+
+  await page.setRequestInterception(true);
+  page.on("request", req => {
+    const url      = req.url();
+    const type     = req.resourceType();
+    const isAsset  = ["image", "stylesheet", "font", "media"].includes(type);
+
+    if (isAsset && isInternal(url)) assetRequests.add(url);
+
+    // Block tracking scripts to speed up rendering
+    if (/google(tag|analytics)|facebook|hotjar|gtm\.|clarity|linkedin/i.test(url)) {
+      req.abort();
+    } else {
+      req.continue();
+    }
+  });
+
+  let status = 200;
+  try {
+    const res = await page.goto(liveURL, { waitUntil: "networkidle2", timeout: 30000 });
+    status = res?.status() ?? 200;
+  } catch (err) {
+    console.warn(`  ⚠ ${liveURL} — ${err.message}, skipping`);
+    await page.close();
     return [];
   }
 
-  const $ = cheerio.load(await res.text());
-  stripNoise($);
+  if (status >= 400) {
+    console.warn(`  ⚠ ${liveURL} — HTTP ${status}, skipping`);
+    await page.close();
+    return [];
+  }
 
-  // Collect outbound internal links before we rewrite them
-  const discovered = [];
-  $("a[href]").each((_, el) => {
-    const href = $(el).attr("href");
-    try {
-      const abs = new URL(href, liveURL);
-      if (abs.hostname.endsWith("abano.be")) {
-        const p = abs.pathname.endsWith("/") ? abs.pathname : abs.pathname + "/";
-        if (!CRAWL_SKIP.test(p)) discovered.push(p);
-      }
-    } catch {}
+  // Wait for Divi animations / lazy content to settle
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  await new Promise(r => setTimeout(r, 800));
+
+  // Collect internal links for the crawler queue
+  const discovered = await page.evaluate((base, skip) => {
+    const skipRe = new RegExp(skip);
+    return [...document.querySelectorAll("a[href]")]
+      .map(a => {
+        try {
+          const u = new URL(a.href);
+          if (!u.hostname.endsWith("abano.be")) return null;
+          const p = u.pathname.endsWith("/") ? u.pathname : u.pathname + "/";
+          return skipRe.test(p) ? null : p;
+        } catch { return null; }
+      })
+      .filter(Boolean);
+  }, BASE_URL, CRAWL_SKIP.source);
+
+  // Strip noise from the live DOM before snapshotting
+  await page.evaluate(() => {
+    const remove = [
+      "#wpadminbar", ".cookie-notice", "#cookie-notice",
+      ".cc-window", ".cc-revoke", "#query-monitor",
+    ];
+    remove.forEach(sel => document.querySelectorAll(sel).forEach(el => el.remove()));
+
+    // Remove tracking scripts only
+    document.querySelectorAll("script[src]").forEach(s => {
+      if (/google(tag|analytics)|facebook|hotjar|gtm\.|clarity|linkedin/i.test(s.src))
+        s.remove();
+    });
   });
 
-  // Download linked stylesheets
-  const cssJobs = [];
-  $('link[rel="stylesheet"][href]').each((_, el) => {
-    cssJobs.push(limit(async () => {
-      const href = $(el).attr("href");
-      try {
-        const abs = new URL(href, liveURL).href;
-        if (isInternal(abs)) $(el).attr("href", await downloadAsset(abs));
-      } catch {}
-    }));
-  });
-  await Promise.all(cssJobs);
+  // Get the fully-rendered HTML
+  const html = await page.content();
+  await page.close();
 
-  await localizeAssets($, liveURL);
+  // Download all intercepted assets concurrently
+  await Promise.all([...assetRequests].map(u => limit(() => downloadAsset(u))));
+
+  // Post-process with cheerio: rewrite asset URLs to local paths
+  const $ = cheerio.load(html);
   fixLinks($, liveURL);
-  $("style").remove(); // re-inlined below via siteStyles
 
-  const title = $("title").text() || pagePath;
-  $("title").remove();
+  // Rewrite src/href of downloaded assets to local paths
+  $("img[src], source[src]").each((_, el) => {
+    const src  = $(el).attr("src");
+    const local = src ? assetCache.get(new URL(src, liveURL).href) : null;
+    if (local) $(el).attr("src", local).removeAttr("srcset").removeAttr("sizes");
+  });
 
-  const out = `<!DOCTYPE html>
-<html lang="nl">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${title}</title>
-  <link rel="canonical" href="${BASE_URL}${pagePath}">
-  ${$("head").html() || ""}
-  <style>${siteStyles}</style>
-</head>
-<body>
-${$("body").html() || ""}
-</body>
-</html>`;
+  $('link[rel="stylesheet"][href]').each((_, el) => {
+    const href  = $(el).attr("href");
+    const local = href ? assetCache.get(new URL(href, liveURL).href) : null;
+    if (local) $(el).attr("href", local);
+  });
 
-  const outDir = path.join(OUTPUT_DIR, ...pagePath.split("/").filter(Boolean));
-  await fs.ensureDir(outDir);
-  await fs.writeFile(path.join(outDir, "index.html"), out);
+  const out = $.html();
 
-  return discovered;
+  if (shouldWrite) {
+    const outDir = path.join(OUTPUT_DIR, ...pagePath.split("/").filter(Boolean));
+    await fs.ensureDir(outDir);
+    await fs.writeFile(path.join(outDir, "index.html"), out);
+  }
+
+  return [...new Set(discovered)];
 }
 
-// Spider all internal links starting from seed paths, skipping anything
-// already exported by the WP REST API or already visited.
-async function crawlMissingPages(knownPaths, navItems) {
-  const visited = new Set(knownPaths);
-  const queue   = ["/"];   // start from homepage, which will surface all nav links
+// ─── WordPress sitemap reader ─────────────────────────────────────────────────
+
+// Parse all <loc> values from a sitemap XML string.
+// Handles both plain <loc>https://…</loc> and CDATA-wrapped <loc><![CDATA[https://…]]></loc>
+function parseLocsFromXML(xml) {
+  return [...xml.matchAll(/<loc>(?:<!\[CDATA\[)?\s*(https?:\/\/[^\]<\s]+)\s*(?:\]\]>)?<\/loc>/gi)]
+    .map(m => m[1].trim())
+    .filter(u => isInternal(u));
+}
+
+async function fetchWPSitemapURLs() {
+  const candidates = [
+    `${BASE_URL}/wp-sitemap.xml`,
+    `${BASE_URL}/sitemap_index.xml`,
+    `${BASE_URL}/sitemap.xml`,
+  ];
+
+  for (const url of candidates) {
+    try {
+      const res = await fetch(url, { timeout: 10000 });
+      if (!res.ok) continue;
+      const xml = await res.text();
+      if (!xml.includes("<loc>")) continue;
+
+      // Decide: sitemap index (contains child .xml refs) or regular sitemap
+      const isSitemapIndex = xml.includes("<sitemapindex") || xml.includes("<sitemap>");
+
+      let pageLocs = [];
+
+      if (isSitemapIndex) {
+        // Extract child sitemap URLs using the CDATA-aware parser
+        const childUrls = parseLocsFromXML(xml).filter(u => u.endsWith(".xml"));
+
+        for (const childUrl of childUrls) {
+          // Skip attachment/tag/category sitemaps — only pages and posts matter
+          if (/attachment|post_tag|category/i.test(childUrl)) continue;
+          try {
+            const cr = await fetch(childUrl, { timeout: 10000 });
+            if (!cr.ok) continue;
+            const childXml = await cr.text();
+            // Only keep non-.xml locs (actual HTML pages)
+            pageLocs = pageLocs.concat(
+              parseLocsFromXML(childXml).filter(u => !u.endsWith(".xml"))
+            );
+          } catch {}
+        }
+      } else {
+        pageLocs = parseLocsFromXML(xml).filter(u => !u.endsWith(".xml"));
+      }
+
+      const paths = [...new Set(
+        pageLocs.map(u => { try { return new URL(u).pathname; } catch { return null; } })
+               .filter(Boolean)
+      )];
+
+      if (paths.length) {
+        console.log(`  ✓ Sitemap: ${paths.length} page URLs from ${url}`);
+        return paths;
+      }
+    } catch {}
+  }
+
+  console.warn("  ⚠ No sitemap found — falling back to homepage link discovery only");
+  return [];
+}
+
+// ─── Crawler ──────────────────────────────────────────────────────────────────
+
+// Crawl all pages not yet written to disk.
+// Seeds from the WP sitemap so JS-rendered nav links are never missed.
+// Uses actual file existence — not an assumed list — to decide whether to write.
+async function crawlMissingPages(navItems) {
+  const sitemapPaths = await fetchWPSitemapURLs();
+
+  const seedPaths = sitemapPaths.length ? [...sitemapPaths] : ["/"];
+  if (!seedPaths.includes("/")) seedPaths.push("/");
+
+  const visited = new Set();
+  const queue   = [...seedPaths];
   let   count   = 0;
 
   while (queue.length) {
     const pagePath = queue.shift();
-    if (visited.has(pagePath)) continue;
+    if (visited.has(pagePath) || CRAWL_SKIP.test(pagePath)) continue;
     visited.add(pagePath);
 
-    process.stdout.write(`  crawling ${pagePath} ...`);
-    const discovered = await crawlPage(pagePath, navItems);
-    count++;
+    // Check disk — don't trust a pre-computed list
+    const segments   = pagePath.split("/").filter(Boolean);
+    const indexFile  = path.join(OUTPUT_DIR, ...segments, "index.html");
+    const needsWrite = !await fs.pathExists(indexFile);
+
+    process.stdout.write(`  ${needsWrite ? "+" : "~"} ${pagePath} ...`);
+
+    const discovered = await crawlPage(pagePath, navItems, needsWrite);
+    if (needsWrite) count++;
     console.log(" ✓");
 
     for (const p of discovered) {
@@ -395,7 +519,7 @@ async function crawlMissingPages(knownPaths, navItems) {
     }
   }
 
-  return { visited, count };
+  return { count };
 }
 
 // ─── WP REST API helpers ──────────────────────────────────────────────────────
@@ -623,64 +747,55 @@ async function main() {
   const t0 = Date.now();
   console.log("Abano static export\n");
 
-  // Clean generated output but leave project source files (scripts/, package.json, etc.)
+  // Clean generated output, keep project source files
   const KEEP = new Set(["scripts", "node_modules", "package.json", "package-lock.json", ".git", ".gitignore"]);
   for (const entry of await fs.readdir(OUTPUT_DIR)) {
     if (!KEEP.has(entry)) await fs.remove(path.join(OUTPUT_DIR, entry));
   }
   await fs.ensureDir(ASSETS_DIR);
 
-  // ── Navigation
-  console.log("[1/7] Navigation...");
-  const navItems = await fetchNavItems();
+  // Launch browser once and reuse for all pages
+  browser = await puppeteer.launch({ headless: "new", args: ["--no-sandbox"] });
 
-  // ── Homepage (also populates siteStyles used by every other page)
-  console.log("[2/7] Homepage...");
-  await generateHomepage(navItems);
+  try {
+    // [1] Navigation
+    console.log("[1/5] Navigation...");
+    const navItems = await fetchNavItems();
 
-  // ── WP content
-  console.log("[3/7] Fetching posts...");
-  const posts = await fetchAll("posts", { _embed: 1, orderby: "date", order: "desc" });
-  console.log(`  ✓ ${posts.length} posts`);
+    // [2] Homepage
+    console.log("[2/5] Homepage...");
+    await generateHomepage();
 
-  console.log("[4/7] Fetching pages...");
-  const pages = await fetchAll("pages", { _embed: 1 });
-  console.log(`  ✓ ${pages.length} pages`);
+    // [3] Post metadata for blog index only
+    console.log("[3/5] Fetching post metadata...");
+    const posts = await fetchAll("posts", {
+      _embed: 1,
+      orderby: "date",
+      order:   "desc",
+      _fields: "id,slug,title,excerpt,date,modified,_links,_embedded",
+    });
+    console.log(`  ✓ ${posts.length} posts`);
 
-  // ── Render posts (concurrent, rate-limited)
-  console.log("[5/7] Rendering posts...");
-  await Promise.all(posts.map(post => limit(() => renderPost(post, "posts", navItems))));
-  console.log(`  ✓ ${posts.length} posts rendered`);
+    // [4] Blog index
+    console.log("[4/5] Blog index...");
+    await generateBlogIndex(posts, navItems);
 
-  // ── Render pages
-  console.log("[6/7] Rendering pages...");
-  const skipSlugs = new Set(["home"]);
-  for (const page of pages) {
-    if (skipSlugs.has(page.slug) || page.link === `${BASE_URL}/`) continue;
-    await renderPost(page, "pages", navItems);
+    // [5] Crawl every URL — browser executes Divi JS so layout is pixel-perfect
+    console.log("[5/5] Crawling all pages from sitemap...");
+    const { count } = await crawlMissingPages(navItems);
+    console.log(`  ✓ ${count} page(s) written`);
+
+  } finally {
+    await browser.close();
   }
-  const rendered = pages.filter(p => !skipSlugs.has(p.slug) && p.link !== `${BASE_URL}/`).length;
-  console.log(`  ✓ ${rendered} pages rendered`);
 
-  // ── Spider: find and export any pages not covered by the WP REST API
-  console.log("[7/8] Spidering for missing pages...");
-  const knownPaths = [
-    "/",
-    "/news/",
-    ...posts.map(p => `/news/${p.slug}/`),
-    ...pages.map(p => `/${p.slug}/`),
-  ];
-  const { count: crawled } = await crawlMissingPages(knownPaths, navItems);
-  console.log(`  ✓ ${crawled} additional page(s) crawled`);
-
-  // ── Blog index
-  console.log("[8/8] Blog index, sitemap, static files...");
-  await generateBlogIndex(posts, navItems);
+  // Sitemap + static files
+  const pages = await fetchAll("pages", { _fields: "slug,modified" });
   await generateSitemap(posts, pages);
   await writeStaticFiles(navItems);
 
   const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-  console.log(`\nDone in ${elapsed}s — ${assetCache.size} assets → ./dist`);
+  console.log(`\nDone in ${elapsed}s — ${assetCache.size} assets downloaded`);
 }
 
 main().catch(err => { console.error("Fatal:", err); process.exit(1); });
