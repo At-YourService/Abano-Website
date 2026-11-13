@@ -4,6 +4,7 @@
   "description": "WordPress static export for www.abano.be",
   "scripts": {
     "export": "node scripts/export.js",
+    "clean": "node scripts/clean.js",
     "serve": "npx serve . -p 3000"
   },
   "dependencies": {
